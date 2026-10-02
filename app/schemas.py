@@ -60,12 +60,29 @@ class CatalogIn(BaseModel):
         return v
 
 
+class LockedIn(BaseModel):
+    """锁定安排：课程必须安排在指定学期；锁定课程视为本次必修。"""
+
+    code: str = Field(min_length=1, max_length=32)
+    semester: str = Field(min_length=1, description="锁定学期，如 2026-FALL，须在规划期限内")
+
+    @field_validator("code")
+    @classmethod
+    def norm_code(cls, v):
+        return _norm_code(v)
+
+
 class PlanIn(BaseModel):
     completed_courses: list[str] = Field(default_factory=list, description="已修课程")
     target_courses: list[str] = Field(min_length=1, description="目标课程，非空")
     start_semester: str = Field(description="起始学期，如 2026-SPRING")
     max_credits_per_semester: int = Field(gt=0, description="每学期学分上限，必须为正")
     num_semesters: int = Field(gt=0, description="规划学期数，必须为正")
+    locked: list[LockedIn] = Field(
+        default_factory=list,
+        description="锁定安排：课程+学期；锁定课程视为本次必修，不得是已修课，不得重复锁定")
+    unavailable_semesters: list[str] = Field(
+        default_factory=list, description="不可排课学期：这些学期不安排课程")
 
     @field_validator("completed_courses", "target_courses")
     @classmethod
@@ -74,6 +91,19 @@ class PlanIn(BaseModel):
         if info.field_name == "target_courses" and not codes:
             raise ValueError("目标课程不能为空")
         return codes
+
+    @field_validator("locked")
+    @classmethod
+    def no_duplicate_lock(cls, v):
+        codes = [x.code for x in v]
+        if len(codes) != len(set(codes)):
+            raise ValueError("重复锁定同一课程")
+        return v
+
+    @field_validator("unavailable_semesters")
+    @classmethod
+    def dedupe_unavailable(cls, v):
+        return sorted({x.strip() for x in v if x.strip()})
 
 
 class ReplanIn(BaseModel):

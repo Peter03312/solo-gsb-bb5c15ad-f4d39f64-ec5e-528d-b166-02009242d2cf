@@ -125,3 +125,69 @@ curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
   "target_courses": ["CS101"], "start_semester": "2026-SPRING",
   "max_credits_per_semester": 0, "num_semesters": 6
 }'; echo
+
+step "21. 锁定安排 + 不可排课学期：CS201 锁定 2026-FALL，2027-SPRING 不排课"
+curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "completed_courses": [],
+  "target_courses": ["CS401"],
+  "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12,
+  "num_semesters": 6,
+  "locked": [{"code": "CS201", "semester": "2026-FALL"}],
+  "unavailable_semesters": ["2027-SPRING"]
+}'; echo
+
+step "22. 锁定非目标课程：CS303 视为本次必修并固定在 2027-SPRING"
+curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "completed_courses": [],
+  "target_courses": ["CS401"],
+  "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12,
+  "num_semesters": 6,
+  "locked": [{"code": "CS303", "semester": "2027-SPRING"}]
+}'; echo
+
+step "23. 错误示例：重复锁定同一课程（422 INVALID_INPUT）"
+curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "target_courses": ["CS401"], "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12, "num_semesters": 6,
+  "locked": [{"code": "CS201", "semester": "2026-FALL"},
+             {"code": "CS201", "semester": "2027-SPRING"}]
+}'; echo
+
+step "24. 错误示例：锁定已修课（400 INVALID_INPUT）"
+curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "completed_courses": ["CS101", "CS101L"],
+  "target_courses": ["CS401"], "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12, "num_semesters": 6,
+  "locked": [{"code": "CS101", "semester": "2026-FALL"}]
+}'; echo
+
+step "25. 错误示例：锁定学期超出规划期限（400 INVALID_INPUT）"
+curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "target_courses": ["CS401"], "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12, "num_semesters": 6,
+  "locked": [{"code": "CS201", "semester": "2029-SPRING"}]
+}'; echo
+
+step "26. 错误示例：锁定学期不在开课季节（422 REQUIREMENT_CONFLICT，CS401 仅秋季开课）"
+curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "target_courses": ["CS401"], "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12, "num_semesters": 6,
+  "locked": [{"code": "CS401", "semester": "2027-SPRING"}]
+}'; echo
+
+step "27. 错误示例：锁定学期为不可排课学期（422 REQUIREMENT_CONFLICT）"
+curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "target_courses": ["CS401"], "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12, "num_semesters": 6,
+  "locked": [{"code": "CS201", "semester": "2026-FALL"}],
+  "unavailable_semesters": ["2026-FALL"]
+}'; echo
+
+step "28. 错误示例：不可排课学期过多，期限内无解（422 NO_SOLUTION，不保存）"
+curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "target_courses": ["CS401"], "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12, "num_semesters": 6,
+  "unavailable_semesters": ["2026-FALL", "2027-SPRING", "2027-FALL", "2028-SPRING"]
+}'; echo

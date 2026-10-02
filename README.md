@@ -11,12 +11,20 @@
   - 同修课程（coreq）尚未修过时，必须与该课**同学期**安排。
 - **规划输入**：已修课程、目标课程（非空）、起始学期（如 `2026-SPRING`）、
   每学期学分上限、规划学期数。学分与两个上限必须为正，非法输入一律拒绝（422/400）。
+- **锁定安排与不可排课学期（可选）**：
+  - `locked`：锁定安排列表（课程代码 + 学期）。锁定课程视为**本次必修**
+    （即使不在目标课程中），且必须安排在指定学期；不得锁定已修课、不得重复锁定，
+    学期须在规划期限内。锁定课程与其同修课（未修过时）一起固定在该学期。
+  - `unavailable_semesters`：不可排课学期列表，这些学期不安排任何课程
+    （结果中对应学期为空），学期同样须在规划期限内。
+  - 锁定及其他课程仍须满足开课季节、先修组、同修同学期与每学期学分上限；
+    不带这两个字段的既有请求与返回格式保持不变。
 - **规划输出**：
-  - 已修课程不重复排入；方案只包含目标课程及满足条件所需的课程。
+  - 已修课程不重复排入；方案只包含目标课程、锁定课程及满足条件所需的课程。
   - 返回期限内**最早完成**的完整方案；完成学期相同者，按“各学期课程代码序列”
     （每学期内代码升序、再按学期先后组成序列）的**字典序**取最小者。
-  - 课程缺失、条件冲突（先修循环、同修课无共同开课学期等）或期限内无解时，
-    返回具体原因，**不返回部分课表**。
+  - 课程缺失、条件冲突（先修循环、同修课无共同开课学期、锁定与约束冲突等）
+    或期限内无解时，返回具体原因，**不返回部分课表**。
 - **目录版本**：每次目录修订生成新版本；方案创建时绑定当前版本，可随时回看；
   确认方案时若目录已修订，则拒绝（409）且不写入。
 - **执行中途滚动重排（草案）**：已确认方案执行过程中，如实际完成情况与计划不同或目录已修订，
@@ -73,7 +81,7 @@ Compose 通过命名卷 `planner-data` 持久化数据。
 | POST | `/catalog/versions` | 目录修订：全量提交课程集合，生成新版本 |
 | GET | `/catalog/current` | 当前目录版本及全部课程 |
 | GET | `/catalog/versions/{id}` | 查看历史目录版本（供回看） |
-| POST | `/plans` | 生成规划方案（绑定当前目录版本） |
+| POST | `/plans` | 生成规划方案（绑定当前目录版本；可选锁定安排与不可排课学期） |
 | GET | `/plans` | 方案列表 |
 | GET | `/plans/{id}` | 回看方案（含绑定的目录版本号） |
 | POST | `/plans/{id}/confirm` | 确认方案/草案；目录已修订则 409 拒绝且不写入 |
@@ -139,6 +147,58 @@ curl -X POST http://localhost:8000/catalog/versions \
 curl http://localhost:8000/plans/<plan_id>                       # 回看方案（含绑定版本）
 curl http://localhost:8000/catalog/versions/1                    # 回看历史目录
 ```
+
+### 锁定安排与不可排课学期
+
+已确定部分课程的修读学期、或某些学期无法上课时，在创建方案时附加可选字段即可；
+锁定课程视为本次必修（即使不在目标课程中），不可排课学期不安排课程：
+
+```bash
+curl -X POST http://localhost:8000/plans -H 'Content-Type: application/json' -d '{
+  "completed_courses": [],
+  "target_courses": ["CS401"],
+  "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12,
+  "num_semesters": 6,
+  "locked": [{"code": "CS201", "semester": "2026-FALL"}],
+  "unavailable_semesters": ["2027-SPRING"]
+}'
+```
+
+响应（201，节选）：CS201 固定在 2026-FALL，2027-SPRING 不排课，完成学期顺延至 2028-FALL：
+
+```json
+{
+  "plan_id": "f19f9dd3eca6",
+  "status": "proposed",
+  "catalog_version": 1,
+  "request": {
+    "target_courses": ["CS401"],
+    "locked": [{"code": "CS201", "semester": "2026-FALL"}],
+    "unavailable_semesters": ["2027-SPRING"],
+    "...": "..."
+  },
+  "result": {
+    "completion_semester": "2028-FALL",
+    "semesters": [
+      {"semester": "2026-SPRING", "courses": [{"code": "CS101"}, {"code": "CS101L"}]},
+      {"semester": "2026-FALL",   "courses": [{"code": "CS201"}]},
+      {"semester": "2027-SPRING", "courses": []},
+      {"semester": "2027-FALL",   "courses": [{"code": "MATH103"}]},
+      {"semester": "2028-SPRING", "courses": [{"code": "CS301"}]},
+      {"semester": "2028-FALL",   "courses": [{"code": "CS401"}]}
+    ]
+  }
+}
+```
+
+约束与报错（均不保存部分方案）：
+
+- 锁定课程不得是已修课、不得重复锁定，学期须在规划期限内（否则 400/422 `INVALID_INPUT`）；
+- 锁定课程不在当前目录（422 `COURSE_MISSING`）；
+- 锁定学期不在开课季节、同修课被锁定到不同学期、锁定学期为不可排课学期、
+  锁定学期之前来不及完成先修（422 `REQUIREMENT_CONFLICT`）；
+- 锁定/不可排课后期限内排不完（422 `NO_SOLUTION`）。
 
 完整可运行示例脚本（含错误演示）：
 
@@ -215,9 +275,9 @@ curl -X POST http://localhost:8000/plans/<plan_id>/replan \
 
 | code | HTTP | 含义 |
 | --- | --- | --- |
-| `INVALID_INPUT` | 400/422 | 非法输入：空目标、非正学分/上限、学期格式错误等 |
-| `COURSE_MISSING` | 422 | 课程缺失：目标课程不在当前目录版本中 |
-| `REQUIREMENT_CONFLICT` | 422 | 条件冲突：先修循环、同修课无共同开课学期、同修课不在目录等 |
+| `INVALID_INPUT` | 400/422 | 非法输入：空目标、非正学分/上限、学期格式错误、锁定已修课、重复锁定、锁定/不可排课学期越出期限等 |
+| `COURSE_MISSING` | 422 | 课程缺失：目标或锁定课程不在当前目录版本中 |
+| `REQUIREMENT_CONFLICT` | 422 | 条件冲突：先修循环、同修课无共同开课学期、同修课不在目录、锁定与开课季节/同修/不可排课约束冲突等 |
 | `NO_SOLUTION` | 422 | 无解：期限内无法排完（学分上限/开课季节/先修顺序限制） |
 | `TOO_COMPLEX` | 422 | 组合或搜索超出内置复杂度上限 |
 | `CATALOG_CHANGED` | 409 | 确认（或重排落库）时目录已修订，拒绝且不写入 |
