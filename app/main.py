@@ -138,7 +138,12 @@ def catalog_version(version_id: int):
 
 @app.post("/plans", status_code=201)
 def create_plan(payload: PlanIn):
-    """生成规划方案并绑定当前目录版本；失败时说明原因，不返回部分课表。"""
+    """生成规划方案并绑定当前目录版本；失败时说明原因，不返回部分课表。
+
+    可选锁定安排（locked：课程+学期）与不可排课学期（unavailable_semesters）：
+    锁定课程视为本次必修并须安排在指定学期；不可排课学期不安排任何课程。
+    不带这两个字段的请求行为与返回结构同既有版本一致。
+    """
     with db.session() as conn:
         version = db.get_current_version(conn)
         catalog = _to_catalog(db.load_courses(conn, version["id"]))
@@ -150,13 +155,20 @@ def create_plan(payload: PlanIn):
                 start_semester=payload.start_semester,
                 max_credits=payload.max_credits_per_semester,
                 num_semesters=payload.num_semesters,
+                locked=[(l.course, l.semester) for l in payload.locked],
+                unavailable=payload.unavailable_semesters,
             )
         except PlanError as exc:
             status = 400 if exc.code == "INVALID_INPUT" else 422
             raise HTTPException(status_code=status,
                                 detail={"code": exc.code, "message": exc.message})
+        # 兼容：未提供新字段时，保存的请求回显不含这两个键，与既有格式一致
+        request_data = payload.model_dump()
+        for key in ("locked", "unavailable_semesters"):
+            if not request_data.get(key):
+                request_data.pop(key, None)
         plan_id = uuid.uuid4().hex[:12]
-        db.insert_plan(conn, plan_id, version["id"], payload.model_dump(), result)
+        db.insert_plan(conn, plan_id, version["id"], request_data, result)
         row = db.get_plan(conn, plan_id)
     return _plan_out(row)
 

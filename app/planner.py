@@ -4,6 +4,10 @@
 - 先修条件按“组”声明：每组任选一门，所有组均须满足；被依赖的课程必须安排在更早学期。
 - 同修课程（coreq）若尚未修过，必须与该课同学期安排。
 - 已修课程不重复排入；方案只包含目标课程及满足条件所需课程。
+- 可选锁定安排（课程、学期）：锁定课程视为本次必修（即使不在目标课程中），
+  必须安排在指定学期；锁定学期须在规划期限内，且不得与开课季节、同修同学期、
+  不可排课学期等约束冲突。
+- 可选不可排课学期：该学期不安排任何课程。
 - 目标：在规划期限（num_semesters）内最早完成；完成学期相同者，按“各学期课程
   代码序列”（每学期内代码升序、再按学期先后组成元组）的字典序取最小者。
 """
@@ -61,6 +65,12 @@ def semester_label(start_year, start_season, index):
     """第 index 个学期（1 起）的绝对标签，如 2027-FALL。"""
     year = start_year + (SEASONS.index(start_season) + index - 1) // 2
     return f"{year}-{season_at(start_season, index)}"
+
+
+def semester_index(start_year, start_season, label):
+    """学期标签相对起始学期的序号（1 起）；早于起始学期时返回非正数。"""
+    year, season = parse_semester(label)
+    return (year - start_year) * 2 + (SEASONS.index(season) - SEASONS.index(start_season)) + 1
 
 
 # ---------------------------------------------------------------- 候选课程集合
@@ -188,13 +198,51 @@ def _block_requirements(catalog, completed, blocks):
     return reqs
 
 
+def _fixed_assignments(blocks, lock_items, start_season):
+    """把锁定课程映射到所属同修块，返回 {块编号: 锁定学期序号}。
+
+    同一同修块被锁定到不同学期、或锁定学期该块不开课时，抛出
+    REQUIREMENT_CONFLICT（锁定与约束冲突）。
+    """
+    block_of = {}
+    for bi, b in enumerate(blocks):
+        for c in b.members:
+            block_of[c] = bi
+    fixed = {}
+    fixed_by = {}
+    for code, idx, label in lock_items:
+        bi = block_of[code]
+        if bi in fixed and fixed[bi] != idx:
+            raise PlanError(
+                "REQUIREMENT_CONFLICT",
+                f"同修课程 {'+'.join(blocks[bi].codes)} 必须安排在同一学期，"
+                f"但被锁定到不同学期，锁定与约束冲突",
+            )
+        fixed[bi] = idx
+        fixed_by[bi] = (code, label)
+    for bi, idx in fixed.items():
+        if season_at(start_season, idx) not in blocks[bi].seasons:
+            code, label = fixed_by[bi]
+            seasons = "、".join(s for s in SEASONS if s in blocks[bi].seasons)
+            raise PlanError(
+                "REQUIREMENT_CONFLICT",
+                f"锁定课程 {code} 在锁定学期 {label} 不开课"
+                f"（该课及其同修课程仅 {seasons} 开课），锁定与约束冲突",
+            )
+    return fixed
+
+
 # ---------------------------------------------------------------- 排课搜索
 
-def _schedule(blocks, reqs, num_semesters, start_season, cap):
+def _schedule(blocks, reqs, num_semesters, start_season, cap,
+              fixed=None, unavailable=frozenset()):
     """返回 (k, seq)：最少 k 个学期排完时字典序最小的方案；期限内无解返回 None。
 
     seq 为每学期课程代码（升序）组成的元组的元组，长度 k。
+    fixed: {块编号: 学期序号}，锁定块必须且只能安排在该学期；
+    unavailable: 不可排课学期序号集合，这些学期不安排任何课程。
     """
+    fixed = fixed or {}
     n = len(blocks)
     assign = [-1] * n
     counter = [0]
@@ -207,26 +255,42 @@ def _schedule(blocks, reqs, num_semesters, start_season, cap):
             return True
         if i > k:
             return False
+        # 剪枝：锁定学期已错过的块不可能再安排
+        for b in remaining:
+            f = fixed.get(b)
+            if f is not None and f < i:
+                return False
         # 剪枝：每个剩余块在 i..k 内至少有一个匹配季节的学期
         for b in remaining:
             if not any(season_at(start_season, j) in blocks[b].seasons for j in range(i, k + 1)):
                 return False
         # 剪枝：单季节块的学分不能超过剩余该季节学期的总容量
         for s in SEASONS:
-            fixed = sum(blocks[b].credits for b in remaining if blocks[b].seasons == frozenset({s}))
-            slots = sum(1 for j in range(i, k + 1) if season_at(start_season, j) == s)
-            if fixed > cap * slots:
+            fixed_season = sum(blocks[b].credits for b in remaining
+                               if blocks[b].seasons == frozenset({s}))
+            slots = sum(1 for j in range(i, k + 1)
+                        if season_at(start_season, j) == s and j not in unavailable)
+            if fixed_season > cap * slots:
                 return False
+        if i in unavailable:
+            return dfs(i + 1, k, remaining)  # 不可排课学期只能空过
+        must = frozenset(b for b in remaining if fixed.get(b) == i)
         avail = [
             b for b in remaining
             if season_at(start_season, i) in blocks[b].seasons
+            and fixed.get(b) in (None, i)  # 锁定块只能在其锁定学期安排
             and all(any(0 < assign[o] < i for o in opts) for opts in reqs[b])
         ]
-        # 按“本学期课程代码序列”的字典序枚举本学期子集，首个可行即字典序最小
+        if not must <= frozenset(avail):
+            return False  # 锁定块本学期无法安排（先修未满足等）
+        # 按“本学期课程代码序列”的字典序枚举本学期子集（必含锁定块），首个可行即字典序最小
+        optional = [b for b in avail if b not in must]
+        must_credits = sum(blocks[b].credits for b in must)
         candidates = []
-        for r in range(len(avail) + 1):
-            for combo in combinations(avail, r):
-                if sum(blocks[b].credits for b in combo) <= cap:
+        for r in range(len(optional) + 1):
+            for extra in combinations(optional, r):
+                if must_credits + sum(blocks[b].credits for b in extra) <= cap:
+                    combo = tuple(must) + extra
                     key = tuple(sorted(c for b in combo for c in blocks[b].codes))
                     candidates.append((key, combo))
         candidates.sort(key=lambda x: x[0])
@@ -239,7 +303,8 @@ def _schedule(blocks, reqs, num_semesters, start_season, cap):
                 assign[b] = -1
         return False
 
-    for k in range(1, num_semesters + 1):
+    min_k = max(fixed.values(), default=1)  # 完成学期不早于最晚的锁定学期
+    for k in range(min_k, num_semesters + 1):
         for b in range(n):
             assign[b] = -1
         if dfs(1, k, frozenset(range(n))):
@@ -268,22 +333,63 @@ def _deadlocked_codes(blocks, reqs):
 
 # ---------------------------------------------------------------- 主入口
 
-def build_plan(catalog, completed, targets, start_semester, max_credits, num_semesters):
+def build_plan(catalog, completed, targets, start_semester, max_credits, num_semesters,
+               locked=None, unavailable=None):
     """生成完整方案；失败抛出 PlanError（不返回部分课表）。
 
-    catalog:   {code: Course}
-    completed: 已修课程代码集合
-    targets:   目标课程代码列表（非空）
+    catalog:     {code: Course}
+    completed:   已修课程代码集合
+    targets:     目标课程代码列表（非空）
+    locked:      可选锁定安排，(课程代码, 学期标签) 列表；锁定课程视为本次必修，
+                 必须安排在指定学期，且学期须在规划期限内
+    unavailable: 可选不可排课学期标签列表，这些学期不安排任何课程
     """
     start_year, start_season = parse_semester(start_semester)
     targets = list(dict.fromkeys(t.strip().upper() for t in targets))
     completed = {c.strip().upper() for c in completed}
+    locked = locked or []
+    unavailable = unavailable or []
 
     missing = [t for t in targets if t not in catalog]
     if missing:
         raise PlanError("COURSE_MISSING", f"课程缺失：{'、'.join(missing)} 不在当前目录版本中")
 
-    needed = set(targets) - completed
+    # 锁定安排校验：格式、重复、期限、已修、缺失（不依赖候选集合，一次性检查）
+    lock_items = []  # (课程代码, 学期序号, 学期标签)
+    seen_locked = set()
+    for item in locked:
+        code, label = item
+        code = code.strip().upper()
+        if code in seen_locked:
+            raise PlanError("INVALID_INPUT", f"课程 {code} 被重复锁定")
+        seen_locked.add(code)
+        idx = semester_index(start_year, start_season, label)  # 顺带校验学期格式
+        if not 1 <= idx <= num_semesters:
+            raise PlanError(
+                "INVALID_INPUT",
+                f"锁定课程 {code} 的学期 {label} 不在规划期限"
+                f"（{start_semester} 起共 {num_semesters} 个学期）内")
+        if code not in catalog:
+            raise PlanError("COURSE_MISSING", f"课程缺失：{code} 不在当前目录版本中")
+        if code in completed:
+            raise PlanError("INVALID_INPUT", f"锁定课程 {code} 已是已修课程，不得再锁定排课")
+        lock_items.append((code, idx, label.strip().upper()))
+
+    # 不可排课学期：格式校验后换算为学期序号；期限外的学期不影响排课，忽略
+    unavailable_idx = set()
+    for label in unavailable:
+        idx = semester_index(start_year, start_season, label)  # 顺带校验学期格式
+        if 1 <= idx <= num_semesters:
+            unavailable_idx.add(idx)
+
+    for code, idx, label in lock_items:
+        if idx in unavailable_idx:
+            raise PlanError(
+                "REQUIREMENT_CONFLICT",
+                f"锁定课程 {code} 的学期 {label} 为不可排课学期，锁定与约束冲突")
+
+    locked_codes = {code for code, _, _ in lock_items}
+    needed = (set(targets) | locked_codes) - completed  # 锁定课程视为本次必修
     if not needed:
         return {
             "completion_semester": None,
@@ -306,23 +412,42 @@ def build_plan(catalog, completed, targets, start_semester, max_credits, num_sem
         if reqs is None:
             conflicts.append("先修条件无法满足，条件冲突")
             continue
+        try:
+            fixed = _fixed_assignments(blocks, lock_items, start_season)
+        except PlanError as exc:
+            conflicts.append(exc.message)
+            continue
         heavy = next((b for b in blocks if b.credits > max_credits), None)
         if heavy is not None:
             no_solution_notes.append(
                 f"同修课程 {'+'.join(heavy.codes)} 学分合计 {heavy.credits} "
                 f"超过每学期学分上限 {max_credits}")
             continue
-        sched = _schedule(blocks, reqs, num_semesters, start_season, max_credits)
+        sched = _schedule(blocks, reqs, num_semesters, start_season, max_credits,
+                          fixed=fixed, unavailable=unavailable_idx)
         if sched is None:
-            # 放宽学期数与学分上限再试一次，用于区分“条件冲突”与“期限内无解”
+            # 放宽学期数与学分上限再试一次（锁定与不可排课约束保留），
+            # 用于区分“条件冲突”与“期限内无解”
             relaxed = _schedule(blocks, reqs, max(num_semesters, 2 * len(blocks) + 2),
-                                start_season, sum(b.credits for b in blocks))
+                                start_season, sum(b.credits for b in blocks),
+                                fixed=fixed, unavailable=unavailable_idx)
             if relaxed is None:
-                conflicts.append("先修条件存在循环依赖或无法满足，涉及课程："
-                                 + "、".join(_deadlocked_codes(blocks, reqs)))
+                dead = "、".join(_deadlocked_codes(blocks, reqs))
+                if lock_items:
+                    note = "锁定安排与先修/同修条件冲突，无法排出满足全部锁定的课表"
+                    note += f"，涉及课程：{dead}" if dead else ""
+                else:
+                    note = f"先修条件存在循环依赖或无法满足，涉及课程：{dead}"
+                conflicts.append(note)
             else:
+                factors = []
+                if lock_items:
+                    factors.append("锁定安排")
+                if unavailable_idx:
+                    factors.append("不可排课学期")
+                factors += ["开课学期", "先修顺序"]
                 no_solution_notes.append(
-                    f"受开课学期、先修顺序或每学期学分上限 {max_credits} 限制，"
+                    f"受{'、'.join(factors)}或每学期学分上限 {max_credits} 限制，"
                     f"{num_semesters} 个学期内无法排完所需课程")
             continue
         if best is None or sched < best:

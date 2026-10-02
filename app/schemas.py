@@ -60,12 +60,29 @@ class CatalogIn(BaseModel):
         return v
 
 
+class LockedPlacement(BaseModel):
+    """锁定安排：课程必须安排在指定学期（学期须在规划期限内）。"""
+
+    course: str = Field(min_length=1, max_length=32, description="锁定课程代码")
+    semester: str = Field(description="锁定学期，如 2026-FALL")
+
+    @field_validator("course")
+    @classmethod
+    def norm_course(cls, v):
+        return _norm_code(v)
+
+
 class PlanIn(BaseModel):
     completed_courses: list[str] = Field(default_factory=list, description="已修课程")
     target_courses: list[str] = Field(min_length=1, description="目标课程，非空")
     start_semester: str = Field(description="起始学期，如 2026-SPRING")
     max_credits_per_semester: int = Field(gt=0, description="每学期学分上限，必须为正")
     num_semesters: int = Field(gt=0, description="规划学期数，必须为正")
+    locked: list[LockedPlacement] = Field(
+        default_factory=list,
+        description="锁定安排：课程视为本次必修并须安排在指定学期（即使不在目标课程中）")
+    unavailable_semesters: list[str] = Field(
+        default_factory=list, description="不可排课学期：这些学期不安排任何课程")
 
     @field_validator("completed_courses", "target_courses")
     @classmethod

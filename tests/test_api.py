@@ -135,3 +135,123 @@ def test_invalid_catalog_rejected(client):
 def test_plan_not_found(client):
     assert client.get("/plans/unknown").status_code == 404
     assert client.post("/plans/unknown/confirm").status_code == 404
+
+
+# ---------------------------------------------------------------- 锁定安排与不可排课学期
+
+def test_create_plan_with_locked_course_not_in_targets(client):
+    """锁定非目标课程：视为本次必修并安排在锁定学期；请求回显包含锁定安排。"""
+    r = client.post("/plans", json=plan_payload(
+        locked=[{"course": "CS303", "semester": "2027-SPRING"}]))
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["status"] == "proposed"
+    assert body["catalog_version"] == 1
+    result = body["result"]
+    assert result["completion_semester"] == "2027-FALL"
+    sems = [[c["code"] for c in s["courses"]] for s in result["semesters"]]
+    assert sems == [["CS101", "CS101L"], ["CS201", "MATH103"], ["CS301", "CS303"], ["CS401"]]
+    # 锁定课程（非目标）被排入且位于锁定学期
+    assert "CS303" in sems[2]
+    assert body["request"]["locked"] == [{"course": "CS303", "semester": "2027-SPRING"}]
+    # 可回看，且可正常确认
+    assert client.get(f"/plans/{body['plan_id']}").status_code == 200
+    assert client.post(f"/plans/{body['plan_id']}/confirm").status_code == 200
+
+
+def test_create_plan_with_unavailable_semesters(client):
+    """不可排课学期不安排任何课程，完成学期相应顺延。"""
+    r = client.post("/plans", json=plan_payload(unavailable_semesters=["2026-FALL"]))
+    assert r.status_code == 201, r.text
+    body = r.json()
+    result = body["result"]
+    assert result["completion_semester"] == "2028-FALL"
+    sems = {s["semester"]: s for s in result["semesters"]}
+    assert sems["2026-FALL"]["courses"] == []
+    assert sems["2026-FALL"]["total_credits"] == 0
+    assert body["request"]["unavailable_semesters"] == ["2026-FALL"]
+
+
+def test_create_plan_without_new_fields_keeps_legacy_format(client):
+    """不带新字段的既有请求：行为与返回结构不变（请求回显不含新键）。"""
+    r = client.post("/plans", json=plan_payload())
+    assert r.status_code == 201
+    body = r.json()
+    assert "locked" not in body["request"]
+    assert "unavailable_semesters" not in body["request"]
+    sems = [[c["code"] for c in s["courses"]] for s in body["result"]["semesters"]]
+    assert sems == [["CS101", "CS101L"], ["CS201", "MATH103"], ["CS301"], ["CS401"]]
+
+
+def test_lock_invalid_inputs_rejected(client):
+    # 重复锁定（大小写不敏感）
+    r = client.post("/plans", json=plan_payload(locked=[
+        {"course": "CS303", "semester": "2027-SPRING"},
+        {"course": "cs303", "semester": "2027-FALL"},
+    ]))
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "INVALID_INPUT"
+    # 锁定已修课程
+    r = client.post("/plans", json=plan_payload(
+        completed_courses=["CS101", "CS101L"],
+        locked=[{"course": "CS101", "semester": "2026-SPRING"}]))
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "INVALID_INPUT"
+    # 锁定学期超出规划期限（第 7 学期 > 6）
+    r = client.post("/plans", json=plan_payload(
+        locked=[{"course": "CS401", "semester": "2029-SPRING"}]))
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "INVALID_INPUT"
+    # 锁定学期格式非法
+    r = client.post("/plans", json=plan_payload(
+        locked=[{"course": "CS401", "semester": "2026春"}]))
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "INVALID_INPUT"
+    # 均未保存方案
+    assert client.get("/plans").json() == []
+
+
+def test_lock_course_missing(client):
+    r = client.post("/plans", json=plan_payload(
+        locked=[{"course": "NOPE101", "semester": "2026-SPRING"}]))
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "COURSE_MISSING"
+    assert client.get("/plans").json() == []
+
+
+def test_lock_conflicts_with_constraints(client):
+    # 锁定学期该课不开课（CS401 仅 FALL 开课）
+    r = client.post("/plans", json=plan_payload(
+        locked=[{"course": "CS401", "semester": "2027-SPRING"}]))
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "REQUIREMENT_CONFLICT"
+    # 锁定学期为不可排课学期
+    r = client.post("/plans", json=plan_payload(
+        locked=[{"course": "CS401", "semester": "2027-FALL"}],
+        unavailable_semesters=["2027-FALL"]))
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "REQUIREMENT_CONFLICT"
+    # 同修课程被锁定到不同学期
+    r = client.post("/plans", json=plan_payload(
+        target_courses=["CS101"],
+        locked=[{"course": "CS101", "semester": "2026-SPRING"},
+                {"course": "CS101L", "semester": "2026-FALL"}]))
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "REQUIREMENT_CONFLICT"
+    # 锁定学期早于先修可完成的学期
+    r = client.post("/plans", json=plan_payload(
+        locked=[{"course": "CS301", "semester": "2026-SPRING"}]))
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "REQUIREMENT_CONFLICT"
+    # 均未保存方案
+    assert client.get("/plans").json() == []
+
+
+def test_lock_no_solution_within_horizon(client):
+    # 锁定 MATH103 到第 3 学期会将其后 CS301/CS401 顺延，4 个学期排不完
+    r = client.post("/plans", json=plan_payload(
+        num_semesters=4,
+        locked=[{"course": "MATH103", "semester": "2027-SPRING"}]))
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "NO_SOLUTION"
+    assert client.get("/plans").json() == []
